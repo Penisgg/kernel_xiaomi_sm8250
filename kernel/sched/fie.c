@@ -4,10 +4,12 @@
  */
 
 #include <linux/cpufreq.h>
+#include <linux/debugfs.h>
 #include <linux/fie.h>
 #include <linux/perf_event.h>
 #include <linux/reboot.h>
 #include <linux/sched/topology.h>
+#include <linux/seq_file.h>
 #include <linux/units.h>
 #include <asm/arch_timer.h>
 #include <asm/cputype.h>
@@ -128,6 +130,21 @@ static DEFINE_PER_CPU(struct cpu_pmu, cpu_pmu_evs) = {
 
 static DEFINE_PER_CPU(bool, fie_cpu_ready);
 
+#ifdef CONFIG_DEBUG_FS
+struct fie_stats {
+	atomic64_t pmu_failures;
+	atomic64_t skipped_hooks;
+	atomic64_t zero_cycle_samples;
+	atomic64_t freq_updates;
+};
+
+static DEFINE_PER_CPU(struct fie_stats, fie_stats);
+#define fie_stat_inc(cpu, member) \
+	atomic64_inc(&per_cpu(fie_stats, cpu).member)
+#else
+#define fie_stat_inc(cpu, member) do { } while (0)
+#endif
+
 static DEFINE_PER_CPU_READ_MOSTLY(bool, cpu_has_amu);
 static DEFINE_PER_CPU_READ_MOSTLY(bool, cpu_has_amu_const);
 static DEFINE_PER_CPU_READ_MOSTLY(u32, cpu_max_freq);
@@ -145,8 +162,7 @@ struct throt_data {
 	raw_spinlock_t rate_lock;
 	cpumask_t cpus;
 	unsigned int cap[MAX_CPU_THROTTLE_SRCS];
-	unsigned int idle_cpus;
-	unsigned int nr_domain_cpus;
+	cpumask_t idle_cpus;
 	u64 last_htd_cntpct;
 	int cpu;
 	struct fie_rate_info rate;
@@ -194,7 +210,8 @@ void fie_init_cpu_domain(const struct cpumask *cpus, unsigned int max_freq)
 	raw_spin_lock_init(&t->rate_lock);
 	cpumask_copy(&t->cpus, cpus);
 	t->cpu = cpumask_first(cpus);
-	t->nr_domain_cpus = cpumask_weight(cpus);
+	/* Offline CPUs and CPUs without usable counters start idle. */
+	cpumask_copy(&t->idle_cpus, cpus);
 
 	for_each_cpu(cpu, cpus)
 		per_cpu(domain_throt_data, cpu) = t;
@@ -567,8 +584,10 @@ static void update_cpu_hw_throttle(void)
 	if (htd->const_cyc < cpu_min_sample_cntpct)
 		goto reset_stats;
 
-	if (!htd->cpu_cyc)
+	if (!htd->cpu_cyc) {
+		fie_stat_inc(cpu, zero_cycle_samples);
 		goto reset_stats;
+	}
 
 	/* Calculate the measured frequency */
 	max_freq = per_cpu(cpu_max_freq, cpu);
@@ -646,25 +665,27 @@ reset_stats:
 static void set_cpu_hw_throttle_idle(int cpu, bool idle)
 {
 	struct throt_data *t = per_cpu(domain_throt_data, cpu);
+	unsigned long flags;
 
 	if (!t)
 		return;
 
-	raw_spin_lock(&t->idle_cpu_lock);
+	raw_spin_lock_irqsave(&t->idle_cpu_lock, flags);
 	if (idle) {
 		/*
 		 * Clear the measured hardware throttle for the CPU domain when
 		 * all CPUs in the domain are idle.
 		 */
-		if (++t->idle_cpus == t->nr_domain_cpus) {
+		if (!cpumask_test_and_set_cpu(cpu, &t->idle_cpus) &&
+		    cpumask_equal(&t->idle_cpus, &t->cpus)) {
 			raw_spin_lock(&t->throt_lock);
 			update_thermal_pressure(t, CPU_HW_THROTTLE, UINT_MAX);
 			raw_spin_unlock(&t->throt_lock);
 		}
 	} else {
-		t->idle_cpus--;
+		cpumask_clear_cpu(cpu, &t->idle_cpus);
 	}
-	raw_spin_unlock(&t->idle_cpu_lock);
+	raw_spin_unlock_irqrestore(&t->idle_cpu_lock, flags);
 }
 
 static void reset_sfd_data(struct sfd_data *sfd)
@@ -725,6 +746,7 @@ static void update_freq_scale(int cpu, struct rq *rq, bool local_cpu)
 			freq = min(max_freq, USEC_PER_SEC * sfd->cpu_cyc / ns);
 			per_cpu(arch_freq_scale, cpu) =
 				SCHED_CAPACITY_SCALE * freq / max_freq;
+			fie_stat_inc(cpu, freq_updates);
 			reset_sfd_data(sfd);
 		} else if (sfd->const_cyc) {
 			/*
@@ -767,8 +789,10 @@ void fie_update_rq_clock(struct rq *rq)
 	/* Don't race with CPU hotplug for this CPU or the runqueue's CPU */
 	if (unlikely(!cpu_active(cpu) || !cpu_active(rq->cpu) ||
 		     !READ_ONCE(per_cpu(fie_cpu_ready, cpu)) ||
-		     !READ_ONCE(per_cpu(fie_cpu_ready, rq->cpu))))
+		     !READ_ONCE(per_cpu(fie_cpu_ready, rq->cpu)))) {
+		fie_stat_inc(cpu, skipped_hooks);
 		return;
+	}
 
 	/*
 	 * Update the local CPU's frequency scale info, even if the runqueue in
@@ -804,8 +828,10 @@ void fie_tick_entry(void)
 	if (!static_branch_unlikely(&fie_ready))
 		return;
 
-	if (!READ_ONCE(per_cpu(fie_cpu_ready, raw_smp_processor_id())))
+	if (!READ_ONCE(per_cpu(fie_cpu_ready, raw_smp_processor_id()))) {
+		fie_stat_inc(raw_smp_processor_id(), skipped_hooks);
 		return;
+	}
 
 	update_cpu_hw_throttle();
 }
@@ -822,8 +848,10 @@ static void fie_cpu_idle(int cpu, bool idle)
 		return;
 
 	/* Don't race with CPU hotplug */
-	if (unlikely(!cpu_active(cpu) || !READ_ONCE(per_cpu(fie_cpu_ready, cpu))))
+	if (unlikely(!cpu_active(cpu) || !READ_ONCE(per_cpu(fie_cpu_ready, cpu)))) {
+		fie_stat_inc(cpu, skipped_hooks);
 		return;
+	}
 
 	set_cpu_hw_throttle_idle(cpu, idle);
 
@@ -894,6 +922,7 @@ static int fie_cpuhp_up(unsigned int cpu)
 	if (!has_amu) {
 		ret = create_perf_events(cpu);
 		if (ret) {
+			fie_stat_inc(cpu, pmu_failures);
 			pr_warn_ratelimited("FIE: CPU%u: perf events failed (%d), FIE off on this CPU\n", cpu, ret);
 			return 0;
 		}
@@ -978,6 +1007,28 @@ static struct notifier_block fie_reboot_nb = {
 	.priority = INT_MAX
 };
 
+#ifdef CONFIG_DEBUG_FS
+/* Counters are cumulative across hotplug; this is a live diagnostic snapshot. */
+static int fie_stats_show(struct seq_file *m, void *unused)
+{
+	int cpu;
+
+	seq_puts(m, "cpu ready pmu_failures skipped_hooks zero_cycle_samples freq_updates\n");
+	for_each_possible_cpu(cpu) {
+		struct fie_stats *s = &per_cpu(fie_stats, cpu);
+
+		seq_printf(m, "%d %u %lld %lld %lld %lld\n", cpu,
+			   READ_ONCE(per_cpu(fie_cpu_ready, cpu)),
+			   atomic64_read(&s->pmu_failures),
+			   atomic64_read(&s->skipped_hooks),
+			   atomic64_read(&s->zero_cycle_samples),
+			   atomic64_read(&s->freq_updates));
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(fie_stats);
+#endif
+
 static int __init fie_init(void)
 {
 	/*
@@ -1006,6 +1057,9 @@ static int __init fie_init(void)
 	static_branch_enable(&fie_ready);
 
 	register_reboot_notifier(&fie_reboot_nb);
+#ifdef CONFIG_DEBUG_FS
+	debugfs_create_file("fie_stats", 0400, NULL, NULL, &fie_stats_fops);
+#endif
 
 	pr_info("FIE: Frequency Invariance Engine initialized\n");
 	return 0;

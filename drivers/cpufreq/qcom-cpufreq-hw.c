@@ -72,6 +72,7 @@ struct cpufreq_qcom {
 	char dcvsh_irq_name[MAX_FN_SIZE];
 	bool is_irq_requested;
 	bool cancel_throttle;
+	bool irq_disabled; /* Protected by dcvsh_lock, including in the IRQ thread. */
 	unsigned long last_non_boost_freq;
 };
 
@@ -113,6 +114,18 @@ static ssize_t dcvsh_freq_limit_show(struct device *dev,
 	struct cpufreq_qcom *c = container_of(attr, struct cpufreq_qcom,
 						freq_limit_attr);
 	return scnprintf(buf, PAGE_SIZE, "%lu\n", c->dcvsh_freq_limit);
+}
+
+/* Caller holds dcvsh_lock. Never wait for the IRQ thread under this lock. */
+static void qcom_lmh_set_irq(struct cpufreq_qcom *c, bool enable)
+{
+	if (enable && c->irq_disabled) {
+		c->irq_disabled = false;
+		enable_irq(c->dcvsh_irq);
+	} else if (!enable && !c->irq_disabled) {
+		disable_irq_nosync(c->dcvsh_irq);
+		c->irq_disabled = true;
+	}
 }
 
 static void qcom_lmh_dcvs_notify(struct cpufreq_qcom *c)
@@ -163,7 +176,7 @@ static void qcom_lmh_dcvs_notify(struct cpufreq_qcom *c)
 	 */
 	if (throttled_freq >= requested_freq) {
 		thermal_pressure = policy->cpuinfo.max_freq;
-		enable_irq(c->dcvsh_irq);
+		qcom_lmh_set_irq(c, true);
 		trace_dcvsh_throttle(cpu, 0);
 	} else {
 		/*
@@ -215,12 +228,17 @@ static irqreturn_t dcvsh_handle_isr(int irq, void *data)
 	struct cpufreq_qcom *c = data;
 	u32 regval;
 
+	/* This is a threaded IRQ, so serialize it with polling and hotplug. */
+	mutex_lock(&c->dcvsh_lock);
+	if (c->cancel_throttle)
+		goto out;
+
 	regval = readl_relaxed(c->base + offsets[REG_INTR_STATUS]);
 	if (!(regval & GT_IRQ_STATUS))
-		return IRQ_HANDLED;
+		goto out;
 
 	/* Disable interrupt and enable polling */
-	disable_irq_nosync(c->dcvsh_irq);
+	qcom_lmh_set_irq(c, false);
 
 	regval = readl_relaxed(c->base + offsets[REG_INTR_CLR]);
 	regval |= GT_IRQ_STATUS;
@@ -229,6 +247,8 @@ static irqreturn_t dcvsh_handle_isr(int irq, void *data)
 	trace_dcvsh_throttle(cpumask_first(&c->related_cpus), 1);
 	mod_delayed_work(system_highpri_wq, &c->freq_poll_work, 0);
 
+out:
+	mutex_unlock(&c->dcvsh_lock);
 	return IRQ_HANDLED;
 }
 
@@ -435,21 +455,13 @@ static int qcom_cpufreq_hw_cpu_online(struct cpufreq_policy *policy)
 	 */
 	cancel_delayed_work_sync(&c->freq_poll_work);
 
-	mutex_lock(&c->dcvsh_lock);
-	c->cancel_throttle = false;
-	mutex_unlock(&c->dcvsh_lock);
-
 	irq_set_affinity_hint(c->dcvsh_irq, &c->related_cpus);
 
-	/*
-	 * The line will have been masked either by the offline path or by
-	 * an ISR that fired before the cluster shut down. Re-enable
-	 * conditionally to keep the disable/enable refcount balanced.
-	 */
-	if (irqd_irq_disabled(irq_get_irq_data(c->dcvsh_irq)))
-		enable_irq(c->dcvsh_irq);
-
+	mutex_lock(&c->dcvsh_lock);
 	c->last_lmh_freq = ULONG_MAX;
+	c->cancel_throttle = false;
+	qcom_lmh_set_irq(c, true);
+	mutex_unlock(&c->dcvsh_lock);
 
 	return 0;
 }
@@ -463,19 +475,13 @@ static int qcom_cpufreq_hw_cpu_offline(struct cpufreq_policy *policy)
 
 	mutex_lock(&c->dcvsh_lock);
 	c->cancel_throttle = true;
+	qcom_lmh_set_irq(c, false);
 	mutex_unlock(&c->dcvsh_lock);
 
+	/* Drain the IRQ producer before cancelling any work it could queue. */
+	synchronize_irq(c->dcvsh_irq);
 	cancel_delayed_work_sync(&c->freq_poll_work);
 	irq_set_affinity_hint(c->dcvsh_irq, NULL);
-
-	/*
-	 * The ISR may have already masked the line via disable_irq_nosync().
-	 * Only disable here when it is still enabled so the depth refcount
-	 * stays balanced against the (conditional) enable_irq() inside
-	 * qcom_cpufreq_hw_cpu_online().
-	 */
-	if (!irqd_irq_disabled(irq_get_irq_data(c->dcvsh_irq)))
-		disable_irq(c->dcvsh_irq);
 
 	fie_cpufreq_pressure(cpumask_first(policy->related_cpus), UINT_MAX);
 	c->last_lmh_freq = ULONG_MAX;

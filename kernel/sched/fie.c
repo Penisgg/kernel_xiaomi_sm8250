@@ -920,6 +920,7 @@ static int fie_cpuhp_up(unsigned int cpu)
 
 	/* Clear the hardware throttle idle flag for this CPU */
 	set_cpu_hw_throttle_idle(cpu, false);
+	WRITE_ONCE(per_cpu(fie_cpu_ready, cpu), true);
 	return 0;
 }
 

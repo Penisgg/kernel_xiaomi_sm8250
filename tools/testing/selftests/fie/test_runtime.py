@@ -18,6 +18,7 @@ def function(path, signature):
 
 class RuntimeTests(unittest.TestCase):
     def test_idle_and_irq_state(self):
+        domain = function("kernel/sched/fie.c", "static struct throt_data *fie_cpu_domain(")
         idle = function("kernel/sched/fie.c", "static void set_cpu_hw_throttle_idle(")
         irq = function("drivers/cpufreq/qcom-cpufreq-hw.c", "static void qcom_lmh_set_irq(")
         source = r'''
@@ -30,6 +31,7 @@ struct throt_data { cpumask_t idle_cpus, cpus; int idle_cpu_lock, throt_lock; };
 static struct throt_data *domains[3];
 #define domain_throt_data domains
 #define per_cpu(var, cpu) var[cpu]
+#define smp_load_acquire(ptr) (*(ptr))
 #define raw_spin_lock_irqsave(lock, flags) do { (flags) = 0; } while (0)
 #define raw_spin_unlock_irqrestore(lock, flags) do { (void)(flags); } while (0)
 #define raw_spin_lock(lock) do { } while (0)
@@ -47,7 +49,7 @@ static int depth;
 static void enable_irq(int irq) { assert(irq == 1); assert(depth == 1); depth--; }
 static void disable_irq_nosync(int irq) { assert(irq == 1); assert(depth == 0); depth++; }
 '''
-        source += idle + "\n" + irq + r'''
+        source += domain + "\n" + idle + "\n" + irq + r'''
 int main(void)
 {
     /* Every successful CPU subset; the rest model offline/failed PMU CPUs. */

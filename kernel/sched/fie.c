@@ -89,6 +89,7 @@ struct pmu_stat {
 };
 
 struct cpu_pmu {
+	bool needs_rebase;
 	/*
 	 * The cur_ptr array is passed as an argument to cmpxchg_double_local(),
 	 * which is implemented with the CASP instruction on AAarch64.
@@ -136,6 +137,7 @@ struct fie_stats {
 	atomic64_t skipped_hooks;
 	atomic64_t zero_cycle_samples;
 	atomic64_t freq_updates;
+	atomic64_t invalid_pmu_samples;
 };
 
 static DEFINE_PER_CPU(struct fie_stats, fie_stats);
@@ -171,6 +173,17 @@ struct throt_data {
 static DEFINE_PER_CPU_READ_MOSTLY(struct throt_data *, domain_throt_data);
 static LIST_HEAD(domain_throt_list);
 
+static struct throt_data *fie_cpu_domain(int cpu)
+{
+	/* Pairs with publication after domain and max-frequency initialization. */
+	return smp_load_acquire(&per_cpu(domain_throt_data, cpu));
+}
+
+static bool fie_domain_ready(int cpu)
+{
+	return fie_cpu_domain(cpu) && READ_ONCE(per_cpu(cpu_max_freq, cpu));
+}
+
 static DEFINE_STATIC_KEY_FALSE(fie_ready);
 static int cpuhp_state;
 
@@ -199,8 +212,11 @@ void fie_init_cpu_domain(const struct cpumask *cpus, unsigned int max_freq)
 	struct throt_data *t;
 	int cpu;
 
+	if (WARN_ON_ONCE(!max_freq || cpumask_empty(cpus)))
+		return;
+
 	for_each_cpu(cpu, cpus)
-		per_cpu(cpu_max_freq, cpu) = max_freq;
+		WRITE_ONCE(per_cpu(cpu_max_freq, cpu), max_freq);
 
 	t = kzalloc(sizeof(*t), GFP_KERNEL);
 	BUG_ON(!t);
@@ -213,8 +229,10 @@ void fie_init_cpu_domain(const struct cpumask *cpus, unsigned int max_freq)
 	/* Offline CPUs and CPUs without usable counters start idle. */
 	cpumask_copy(&t->idle_cpus, cpus);
 
-	for_each_cpu(cpu, cpus)
-		per_cpu(domain_throt_data, cpu) = t;
+	for_each_cpu(cpu, cpus) {
+		/* Publish initialized domain state to fie_cpu_domain() readers. */
+		smp_store_release(&per_cpu(domain_throt_data, cpu), t);
+	}
 
 	list_add_tail(&t->node, &domain_throt_list);
 }
@@ -239,6 +257,14 @@ static void release_perf_events(int cpu)
 	}
 }
 
+/* The PMUv3 driver maps PMCCNTR_EL0 to software counter index zero. */
+static bool fie_pmu_event_valid(struct perf_event *event, int cpu)
+{
+	return event && READ_ONCE(event->state) == PERF_EVENT_STATE_ACTIVE &&
+	       READ_ONCE(event->oncpu) == cpu && READ_ONCE(event->hw.idx) == 0 &&
+	       !(READ_ONCE(event->hw.state) & PERF_HES_STOPPED);
+}
+
 static int create_perf_events(int cpu)
 {
 	struct cpu_pmu_evt *cpev = &per_cpu(pevt_pcpu, cpu);
@@ -252,6 +278,7 @@ static int create_perf_events(int cpu)
 		 */
 		.config1 = 0x1
 	};
+	unsigned long flags;
 	int i, ret;
 
 	for (i = 0; i < PMU_EVT_MAX; i++) {
@@ -262,6 +289,13 @@ static int create_perf_events(int cpu)
 			cpev->pev[i] = NULL;
 			goto release_pevs;
 		}
+
+		/* A pinned event can still be inactive or use a general counter. */
+		local_irq_save(flags);
+		ret = fie_pmu_event_valid(cpev->pev[i], cpu) ? 0 : -EBUSY;
+		local_irq_restore(flags);
+		if (ret)
+			goto release_pevs;
 	}
 
 	return 0;
@@ -370,7 +404,7 @@ fie_pmu_read(struct pmu_stat *stat)
 	*stat = (typeof(*stat)){ cntpct, cntpct, cpu_cyc };
 }
 
-static void pmu_get_stats(struct pmu_stat *stat)
+static bool pmu_get_stats(struct pmu_stat *stat)
 {
 	int cpu = raw_smp_processor_id();
 
@@ -381,8 +415,16 @@ static void pmu_get_stats(struct pmu_stat *stat)
 		else
 			fie_amu_read(stat);
 	} else {
+		struct perf_event *event = per_cpu(pevt_pcpu, cpu).pev[CPU_CYCLES];
+
+		/* Callers keep IRQs disabled, preventing local perf rescheduling. */
+		if (unlikely(!fie_pmu_event_valid(event, cpu))) {
+			fie_stat_inc(cpu, invalid_pmu_samples);
+			return false;
+		}
 		fie_pmu_read(stat);
 	}
+	return true;
 }
 
 /*
@@ -444,7 +486,10 @@ static void pmu_get_stats(struct pmu_stat *stat)
 	__PMU_CMPXCHG_DBL_LOOP(cur, old1 ? old1 : old2);		\
 })
 
-static void pmu_update_stats(int cpu, struct cpu_pmu *pmu,
+static void reset_sfd_data(struct sfd_data *sfd);
+static void reset_htd_data(struct htd_data *htd);
+
+static bool pmu_update_stats(int cpu, struct cpu_pmu *pmu,
 			     struct pmu_stat *cur, struct pmu_stat *prev)
 {
 	struct pmu_stat *cur_ptr;
@@ -465,12 +510,27 @@ static void pmu_update_stats(int cpu, struct cpu_pmu *pmu,
 		*prev = *ptr1;
 	}
 
-	pmu_get_stats(cur);
+	if (!pmu_get_stats(cur)) {
+		pmu->needs_rebase = true;
+		reset_htd_data(&pmu->htd);
+		raw_spin_lock(&pmu->sfd.lock);
+		reset_sfd_data(&pmu->sfd);
+		raw_spin_unlock(&pmu->sfd.lock);
+		return false;
+	}
+
+	/* Never include an interval during which our counter was unavailable. */
+	if (pmu->needs_rebase) {
+		if (prev)
+			*prev = *cur;
+		pmu->needs_rebase = false;
+	}
 
 	/* Publish the updated stats */
 	cur_ptr = pmu_get_cur_writer(pmu);
 	*cur_ptr = *cur;
 	pmu_put_cur_writer(pmu, cur_ptr);
+	return true;
 }
 
 /* Must be called with t->throt_lock held */
@@ -498,7 +558,7 @@ static void update_thermal_pressure(struct throt_data *t,
 
 void fie_cpufreq_pressure(int cpu, unsigned int cap)
 {
-	struct throt_data *t = per_cpu(domain_throt_data, cpu);
+	struct throt_data *t = fie_cpu_domain(cpu);
 	unsigned long flags;
 
 	if (!t)
@@ -513,7 +573,7 @@ EXPORT_SYMBOL_GPL(fie_cpufreq_pressure);
 
 void fie_rate_set(int cpu, unsigned int freq)
 {
-	struct throt_data *t = per_cpu(domain_throt_data, cpu);
+	struct throt_data *t = fie_cpu_domain(cpu);
 
 	if (!t)
 		return;
@@ -528,7 +588,7 @@ EXPORT_SYMBOL_GPL(fie_rate_set);
 
 static void fie_rate_info(int cpu, struct fie_rate_info *r)
 {
-	struct throt_data *t = per_cpu(domain_throt_data, cpu);
+	struct throt_data *t = fie_cpu_domain(cpu);
 
 	raw_spin_lock(&t->rate_lock);
 	*r = t->rate;
@@ -537,7 +597,7 @@ static void fie_rate_info(int cpu, struct fie_rate_info *r)
 
 static void fie_rate_latched(int cpu, const struct fie_rate_info *cookie)
 {
-	struct throt_data *t = per_cpu(domain_throt_data, cpu);
+	struct throt_data *t = fie_cpu_domain(cpu);
 
 	raw_spin_lock(&t->rate_lock);
 	if (t->rate.set_time == cookie->set_time &&
@@ -566,7 +626,7 @@ static void add_htd_data(struct htd_data *htd, const struct pmu_stat *cur,
 static void update_cpu_hw_throttle(void)
 {
 	int cpu = raw_smp_processor_id();
-	struct throt_data *t = per_cpu(domain_throt_data, cpu);
+	struct throt_data *t = fie_cpu_domain(cpu);
 	struct cpu_pmu *pmu = &per_cpu(cpu_pmu_evs, cpu);
 	struct htd_data *htd = &pmu->htd;
 	struct fie_rate_info rate_info;
@@ -664,7 +724,7 @@ reset_stats:
 
 static void set_cpu_hw_throttle_idle(int cpu, bool idle)
 {
-	struct throt_data *t = per_cpu(domain_throt_data, cpu);
+	struct throt_data *t = fie_cpu_domain(cpu);
 	unsigned long flags;
 
 	if (!t)
@@ -718,7 +778,8 @@ static void update_freq_scale(int cpu, struct rq *rq, bool local_cpu)
 	struct pmu_stat cur, prev;
 
 	if (local_cpu) {
-		pmu_update_stats(cpu, pmu, &cur, &prev);
+		if (!pmu_update_stats(cpu, pmu, &cur, &prev))
+			return;
 		add_htd_data(htd, &cur, &prev);
 	}
 
@@ -742,6 +803,11 @@ static void update_freq_scale(int cpu, struct rq *rq, bool local_cpu)
 			u64 max_freq = per_cpu(cpu_max_freq, cpu);
 			u64 freq, ns = cntpct_to_ns(sfd->const_cyc);
 
+			if (unlikely(!max_freq)) {
+				reset_sfd_data(sfd);
+				goto unlock;
+			}
+
 			/* Report the measured frequency and reset the stats */
 			freq = min(max_freq, USEC_PER_SEC * sfd->cpu_cyc / ns);
 			per_cpu(arch_freq_scale, cpu) =
@@ -763,6 +829,7 @@ static void update_freq_scale(int cpu, struct rq *rq, bool local_cpu)
 			sfd->stale = true;
 		}
 	}
+unlock:
 	raw_spin_unlock(&sfd->lock);
 
 	/*
@@ -789,7 +856,8 @@ void fie_update_rq_clock(struct rq *rq)
 	/* Don't race with CPU hotplug for this CPU or the runqueue's CPU */
 	if (unlikely(!cpu_active(cpu) || !cpu_active(rq->cpu) ||
 		     !READ_ONCE(per_cpu(fie_cpu_ready, cpu)) ||
-		     !READ_ONCE(per_cpu(fie_cpu_ready, rq->cpu)))) {
+		     !READ_ONCE(per_cpu(fie_cpu_ready, rq->cpu)) ||
+		     !fie_domain_ready(cpu) || !fie_domain_ready(rq->cpu))) {
 		fie_stat_inc(cpu, skipped_hooks);
 		return;
 	}
@@ -828,7 +896,8 @@ void fie_tick_entry(void)
 	if (!static_branch_unlikely(&fie_ready))
 		return;
 
-	if (!READ_ONCE(per_cpu(fie_cpu_ready, raw_smp_processor_id()))) {
+	if (!READ_ONCE(per_cpu(fie_cpu_ready, raw_smp_processor_id())) ||
+	    !fie_domain_ready(raw_smp_processor_id())) {
 		fie_stat_inc(raw_smp_processor_id(), skipped_hooks);
 		return;
 	}
@@ -848,7 +917,8 @@ static void fie_cpu_idle(int cpu, bool idle)
 		return;
 
 	/* Don't race with CPU hotplug */
-	if (unlikely(!cpu_active(cpu) || !READ_ONCE(per_cpu(fie_cpu_ready, cpu)))) {
+	if (unlikely(!cpu_active(cpu) || !READ_ONCE(per_cpu(fie_cpu_ready, cpu)) ||
+		     !fie_domain_ready(cpu))) {
 		fie_stat_inc(cpu, skipped_hooks);
 		return;
 	}
@@ -857,7 +927,8 @@ static void fie_cpu_idle(int cpu, bool idle)
 
 	if (idle) {
 		/* Update the current counters one last time before idling */
-		pmu_update_stats(cpu, pmu, &cur, &prev);
+		if (!pmu_update_stats(cpu, pmu, &cur, &prev))
+			return;
 
 		/* Accumulate data for calculating the CPU's frequency */
 		raw_spin_lock(&sfd->lock);
@@ -917,15 +988,16 @@ static int fie_cpuhp_up(unsigned int cpu)
 #endif
 	per_cpu(cpu_has_amu, cpu) = has_amu;
 	per_cpu(cpu_has_amu_const, cpu) = has_amu;
-	per_cpu(fie_cpu_ready, cpu) = false;
+	WRITE_ONCE(per_cpu(fie_cpu_ready, cpu), false);
+
+	/* Keep cpufreq's fallback when this CPU's domain is not available yet. */
+	if (!fie_domain_ready(cpu))
+		return 0;
 
 	if (!has_amu) {
 		ret = create_perf_events(cpu);
-		if (ret) {
-			fie_stat_inc(cpu, pmu_failures);
-			pr_warn_ratelimited("FIE: CPU%u: perf events failed (%d), FIE off on this CPU\n", cpu, ret);
-			return 0;
-		}
+		if (ret)
+			goto perf_failed;
 	}
 
 	/* Initialize the pointers to the saved CPU stats */
@@ -940,8 +1012,13 @@ static int fie_cpuhp_up(unsigned int cpu)
 	 * from firing during the measurement and thus skewing the data.
 	 */
 	local_irq_disable();
-	pmu_get_stats(&pmu->cur[0]);
+	ret = pmu_get_stats(&pmu->cur[0]) ? 0 : -EBUSY;
 	local_irq_enable();
+	if (ret) {
+		release_perf_events(cpu);
+		goto perf_failed;
+	}
+	pmu->needs_rebase = false;
 	reset_sfd_data(sfd);
 	reset_htd_data(htd);
 
@@ -950,6 +1027,12 @@ static int fie_cpuhp_up(unsigned int cpu)
 	/* Clear the hardware throttle idle flag for this CPU */
 	set_cpu_hw_throttle_idle(cpu, false);
 	WRITE_ONCE(per_cpu(fie_cpu_ready, cpu), true);
+	return 0;
+
+perf_failed:
+	fie_stat_inc(cpu, pmu_failures);
+	pr_warn_ratelimited("FIE: CPU%u: cycle counter unavailable (%d), FIE off\n",
+			    cpu, ret);
 	return 0;
 }
 
@@ -1013,16 +1096,19 @@ static int fie_stats_show(struct seq_file *m, void *unused)
 {
 	int cpu;
 
-	seq_puts(m, "cpu ready pmu_failures skipped_hooks zero_cycle_samples freq_updates\n");
+	seq_puts(m, "cpu ready domain_ready pmu_failures skipped_hooks ");
+	seq_puts(m, "zero_cycle_samples freq_updates invalid_pmu_samples\n");
 	for_each_possible_cpu(cpu) {
 		struct fie_stats *s = &per_cpu(fie_stats, cpu);
 
-		seq_printf(m, "%d %u %lld %lld %lld %lld\n", cpu,
+		seq_printf(m, "%d %u %u %lld %lld %lld %lld %lld\n", cpu,
 			   READ_ONCE(per_cpu(fie_cpu_ready, cpu)),
+			   fie_domain_ready(cpu),
 			   atomic64_read(&s->pmu_failures),
 			   atomic64_read(&s->skipped_hooks),
 			   atomic64_read(&s->zero_cycle_samples),
-			   atomic64_read(&s->freq_updates));
+			   atomic64_read(&s->freq_updates),
+			   atomic64_read(&s->invalid_pmu_samples));
 	}
 	return 0;
 }

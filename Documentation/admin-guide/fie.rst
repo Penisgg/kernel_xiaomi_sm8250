@@ -23,17 +23,38 @@ With debugfs mounted at ``/sys/kernel/debug``, root can read ``fie_stats``.
 Each row contains a CPU ID followed by:
 
 * ``ready``: whether that CPU completed FIE initialization;
-* ``pmu_failures``: failed attempts to create that CPU's perf counters;
+* ``domain_ready``: whether its frequency domain has been published with a
+  nonzero maximum frequency;
+* ``pmu_failures``: failed attempts to create or validate that CPU's perf
+  counters (including inactive events or the wrong hardware counter);
 * ``skipped_hooks``: scheduler, idle or tick hooks skipped because a CPU is
   inactive or FIE is not ready (remote-runqueue checks count on the caller);
 * ``zero_cycle_samples``: otherwise long-enough hardware-throttle samples
   discarded because no CPU cycles were counted;
-* ``freq_updates``: successful frequency-scale updates.
+* ``freq_updates``: successful frequency-scale updates;
+* ``invalid_pmu_samples``: attempted reads skipped because the perf event was
+  not active on this CPU's dedicated cycle counter.
 
 Counters are cumulative across CPU hotplug. The file is a live snapshot,
 not an atomic snapshot of all CPUs. Skipped hooks around hotplug are expected.
 No counters are reset by reading the file. A nonzero ready flag together with
 increasing freq_updates under load confirms that the measurement path runs.
+
+Counter and frequency-domain admission
+--------------------------------------
+
+The PMUv3 driver may allocate a general counter when PMCCNTR_EL0 is busy.
+FIE's direct PMCCNTR_EL0 read is permitted only for an active, running event
+on the local CPU at the driver's dedicated cycle-counter index (zero).
+Unsuitable events are released and CPU bring-up still succeeds without FIE.
+The event is checked again before every direct PMU read. If it becomes
+unusable, accumulated measurements are discarded; the first valid reading
+becomes a new baseline so the unavailable interval is not counted.
+
+An absent domain or zero maximum frequency prevents FIE bring-up on that CPU.
+The cpufreq fallback remains available. If a domain is registered later, FIE
+can retry on the next CPU online cycle; it does not force CPU hotplug itself.
+Hooks also check domain readiness before doing frequency calculations.
 
 Validation
 ----------
@@ -42,7 +63,12 @@ Host checks, run from the source root::
 
     python3 tools/testing/selftests/fie/test_build.py
     python3 tools/testing/selftests/fie/test_runtime.py
+    python3 tools/testing/selftests/fie/test_guards.py
     bash -n build.sh
+
+The guard checks cover wrong/inactive counters, CPU mismatch, absent/zero
+frequency domains, failed-event cleanup, recovery without counting the invalid
+interval, and the legacy block request PM flag mapping.
 
 The build checks mock make, packaging and publication: they do not use the
 network or publish messages. The runtime checks compile the actual idle and
